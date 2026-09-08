@@ -1,7 +1,7 @@
 # Rust
 target/
 
-# Translation data (nyattic/devil-connection-data)
+# Translation data (nyabi-gh/devil-connection-data)
 /data/
 /tyrano/
 

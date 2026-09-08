@@ -1,7 +1,7 @@
 # 데빌 커넥션 비공식 한글 번역 패치
 
-[![Latest Release](https://img.shields.io/github/v/release/nyattic/devil-connection-korean?style=for-the-badge&logo=github&logoColor=white&labelColor=2a1620&color=8a3557)](https://github.com/nyattic/devil-connection-korean/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/nyattic/devil-connection-korean/total?style=for-the-badge&logo=github&logoColor=white&labelColor=2a1620&color=8a3557)](https://github.com/nyattic/devil-connection-korean/releases)
+[![Latest Release](https://img.shields.io/github/v/release/nyabi-gh/devil-connection-korean?style=for-the-badge&logo=github&logoColor=white&labelColor=2a1620&color=8a3557)](https://github.com/nyabi-gh/devil-connection-korean/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/nyabi-gh/devil-connection-korean/total?style=for-the-badge&logo=github&logoColor=white&labelColor=2a1620&color=8a3557)](https://github.com/nyabi-gh/devil-connection-korean/releases)
 [![License](https://img.shields.io/badge/license-All%20Rights%20Reserved-8a3557?style=for-the-badge&labelColor=2a1620)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-8a3557?style=for-the-badge&logo=rust&logoColor=white&labelColor=2a1620)
 
@@ -76,7 +76,7 @@
 번역 데이터는 별도 저장소 `devil-connection-data`에 있습니다. 이 저장소에는 패치 프로그램 소스만 들어 있습니다.
 
 ```sh
-git clone https://github.com/nyattic/devil-connection-data.git ../devil-connection-data
+git clone https://github.com/nyabi-gh/devil-connection-data.git ../devil-connection-data
 cargo build --release --features embed-data
 ```
 

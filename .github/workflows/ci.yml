@@ -40,7 +40,7 @@ jobs:
       - name: Check out translation data
         uses: actions/checkout@v7
         with:
-          repository: nyattic/devil-connection-data
+          repository: nyabi-gh/devil-connection-data
           ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
           path: translation-data
 
