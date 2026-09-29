@@ -28,6 +28,7 @@ pub struct AsarArchive<R = BufReader<File>> {
     root: Node,
     data_offset: u64,
     archive_len: u64,
+    header_digest: [u8; 32],
     reader: R,
 }
 
@@ -38,7 +39,7 @@ impl AsarArchive<BufReader<File>> {
         let archive_len = file.metadata().map_err(|e| AsarError::io(&path, e))?.len();
 
         let mut reader = BufReader::new(file);
-        let (root, data_offset) = header::read(&mut reader)?;
+        let (root, data_offset, header_digest) = header::read(&mut reader)?;
 
         Ok(AsarArchive {
             unpacked_dir: unpacked_dir_for(&path),
@@ -46,6 +47,7 @@ impl AsarArchive<BufReader<File>> {
             root,
             data_offset,
             archive_len,
+            header_digest,
             reader,
         })
     }
@@ -54,7 +56,7 @@ impl AsarArchive<BufReader<File>> {
 impl<'a> AsarArchive<Cursor<&'a [u8]>> {
     pub fn from_bytes(bytes: &'a [u8]) -> Result<Self> {
         let mut reader = Cursor::new(bytes);
-        let (root, data_offset) = header::read(&mut reader)?;
+        let (root, data_offset, header_digest) = header::read(&mut reader)?;
 
         if let Some(entry) = header::flatten(&root)
             .into_iter()
@@ -72,6 +74,7 @@ impl<'a> AsarArchive<Cursor<&'a [u8]>> {
             root,
             data_offset,
             archive_len: bytes.len() as u64,
+            header_digest,
             reader,
         })
     }
@@ -92,6 +95,10 @@ impl<R: Read + Seek> AsarArchive<R> {
 
     pub fn data_offset(&self) -> u64 {
         self.data_offset
+    }
+
+    pub fn header_digest(&self) -> [u8; 32] {
+        self.header_digest
     }
 
     pub fn entries(&self) -> Vec<Entry> {

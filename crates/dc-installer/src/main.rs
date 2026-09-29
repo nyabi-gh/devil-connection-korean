@@ -1,10 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use dc_installer::{
-    Cancel, Event, InstallConfig, Level, Reporter, TranslationSource, detect_game_dirs, game,
-    install, locate_asar, restore,
+    Cancel, Event, InstallConfig, Level, PatchState, Reporter, TranslationSource, backup_path,
+    detect_game_dirs, game, install, locate_asar, patch_state, restore,
 };
 
 #[derive(Parser)]
@@ -141,6 +141,11 @@ fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
                     "없음"
                 }
             );
+            match patch_state(&asar) {
+                Ok(PatchState::Patched) => println!("상태:        패치 적용됨"),
+                Ok(PatchState::Original) => println!("상태:        원본"),
+                Err(e) => println!("상태:        확인 실패 - {e}"),
+            }
             match archive.validate() {
                 Ok(()) => println!("헤더 검증:   통과"),
                 Err(e) => println!("헤더 검증:   실패 - {e}"),
@@ -190,10 +195,4 @@ fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-fn backup_path(asar: &Path) -> PathBuf {
-    let mut name = asar.file_name().unwrap_or_default().to_os_string();
-    name.push(".backup");
-    asar.with_file_name(name)
 }
