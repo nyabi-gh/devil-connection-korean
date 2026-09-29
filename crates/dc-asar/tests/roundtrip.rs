@@ -1,7 +1,11 @@
+use std::cell::RefCell;
 use std::fs;
 use std::path::Path;
 
-use dc_asar::{AsarArchive, EntryKind, PackOptions, create_archive};
+use dc_asar::{
+    ArchiveRoot, AsarArchive, EntryKind, Observer, PackOptions, create_archive,
+    create_archive_observed,
+};
 
 const VIDEO_LEN: usize = 5 * 1024 * 1024 + 7;
 
@@ -384,4 +388,42 @@ fn open_rejects_non_asar_files() {
     assert!(!dc_asar::looks_like_asar(
         b"this is definitely not an asar archive"
     ));
+}
+
+#[derive(Default)]
+struct Recorder(RefCell<Vec<(String, u64, u64)>>);
+
+impl Observer for Recorder {
+    fn advance(&self, task: &str, done: u64, total: u64) {
+        self.0.borrow_mut().push((task.to_string(), done, total));
+    }
+
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+fn packing_reports_one_steadily_rising_progress_that_ends_complete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    build_source(&src);
+
+    let recorder = Recorder::default();
+    create_archive_observed(
+        &[ArchiveRoot {
+            archive_path: "",
+            source: &src,
+        }],
+        tmp.path().join("app.asar"),
+        &PackOptions::default(),
+        &recorder,
+    )
+    .unwrap();
+
+    let events = recorder.0.into_inner();
+    let (task, _, total) = events.last().unwrap().clone();
+    assert!(events.iter().all(|(t, _, n)| *t == task && *n == total));
+    assert!(events.windows(2).all(|pair| pair[0].1 < pair[1].1));
+    assert_eq!(events.last().unwrap().1, total);
 }
