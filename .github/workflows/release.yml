@@ -11,18 +11,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  check-version:
+    name: Check tag matches Cargo version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compare versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "devil-connection-korean") | .version')"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo version $version"
+            exit 1
+          fi
+
   build:
     name: Build ${{ matrix.asset }}
+    needs: check-version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             asset: DevilConnection-KR-${{ github.ref_name }}.AppImage
           - os: windows-latest
             asset: DevilConnection-KR-${{ github.ref_name }}.exe
-          - os: macos-latest
+          - os: macos-26
             asset: DevilConnection-KR-${{ github.ref_name }}.zip
     env:
       ASSET: ${{ matrix.asset }}
@@ -143,7 +162,9 @@ jobs:
           chmod +x "$appdir/AppRun"
 
           curl -fsSL -o appimagetool \
-            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+            https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool" \
+            | sha256sum --check --strict
           chmod +x appimagetool
 
           mkdir -p dist
@@ -167,6 +188,10 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      - name: Write checksums
+        working-directory: dist
+        run: sha256sum -- * > SHA256SUMS
 
       - name: Create release
         env:

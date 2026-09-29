@@ -34,7 +34,7 @@
 1. GitHub 페이지 상단의 **[Releases](../../releases)** 탭으로 이동합니다.
 2. 최신 릴리즈에서 본인의 운영체제에 맞는 패치 프로그램을 다운로드합니다.
    - Windows: `DevilConnection-KR-v0.1.3.exe`
-   - macOS: `DevilConnection-KR-v0.1.3.zip`
+   - macOS: `DevilConnection-KR-v0.1.3.zip` (Apple Silicon 전용, Intel Mac은 지원하지 않습니다)
    - Linux: `DevilConnection-KR-v0.1.3.AppImage`
    - 파일 이름의 `v0.1.3` 부분은 릴리즈 버전에 따라 달라집니다.
 3. 다운로드한 프로그램을 실행하고 안내에 따라 진행합니다.
