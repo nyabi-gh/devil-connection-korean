@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 use dc_installer::{
-    Cancel, Event, InstallConfig, Level, PATCH_DIRS, STEPS, TranslationSource, backup_path,
-    detect_game_dirs, locate_asar,
+    Cancel, Event, InstallConfig, Level, PATCH_DIRS, PatchState, STEPS, TranslationSource,
+    check_data_dir, detect_game_dirs, locate_asar, patch_state,
 };
 use egui::{
     Align, Align2, Color32, CornerRadius, LayerId, Layout, Order, Rect, RichText, ScrollArea,
@@ -28,7 +28,7 @@ enum Phase {
     Running { step: u32 },
     Restoring,
     Done,
-    Failed { intact: bool },
+    Failed { intact: bool, restoring: bool },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -78,6 +78,9 @@ pub struct InstallerApp {
     rx: Option<Receiver<Msg>>,
     cancel: Cancel,
     dialog: Option<Dialog>,
+    close_pending: bool,
+    close_ready: bool,
+    window_focused: bool,
 }
 
 impl InstallerApp {
@@ -104,6 +107,9 @@ impl InstallerApp {
             rx: None,
             cancel: Cancel::new(),
             dialog: None,
+            close_pending: false,
+            close_ready: false,
+            window_focused: true,
         };
 
         if app.embedded.is_none()
@@ -121,6 +127,15 @@ impl InstallerApp {
 
     fn restoring(&self) -> bool {
         self.phase == Phase::Restoring
+    }
+
+    fn cancellable(&self) -> bool {
+        match self.phase {
+            Phase::Running { step } => STEPS
+                .get(step as usize - 1)
+                .is_some_and(|info| info.cancellable),
+            _ => false,
+        }
     }
 
     fn log(&mut self, level: Level, text: impl Into<String>) {
@@ -218,11 +233,21 @@ impl InstallerApp {
             }
             Phase::Restoring => ("원본으로 되돌리는 중".to_string(), theme::TEXT),
             Phase::Done => ("설치를 마쳤습니다".to_string(), theme::SUCCESS),
-            Phase::Failed { intact: true } => (
+            Phase::Failed {
+                intact: true,
+                restoring: false,
+            } => (
                 "설치를 멈췄습니다. 게임 파일은 그대로입니다".to_string(),
                 theme::ERROR,
             ),
-            Phase::Failed { intact: false } => (
+            Phase::Failed {
+                intact: true,
+                restoring: true,
+            } => (
+                "되돌리지 못했습니다. 진행 기록을 확인해주세요".to_string(),
+                theme::ERROR,
+            ),
+            Phase::Failed { intact: false, .. } => (
                 "원본 복구에 실패했습니다. 진행 기록을 확인해주세요".to_string(),
                 theme::ERROR,
             ),
@@ -304,7 +329,16 @@ impl InstallerApp {
         };
 
         let mut finished = false;
-        for message in rx.try_iter().collect::<Vec<_>>() {
+        let mut messages = Vec::new();
+        let disconnected = loop {
+            match rx.try_recv() {
+                Ok(message) => messages.push(message),
+                Err(TryRecvError::Empty) => break false,
+                Err(TryRecvError::Disconnected) => break true,
+            }
+        };
+
+        for message in messages {
             match message {
                 Msg::Progress(Event::Step { index, message, .. }) => {
                     self.phase = Phase::Running { step: index };
@@ -327,15 +361,50 @@ impl InstallerApp {
             }
         }
 
+        if disconnected && !finished {
+            finished = true;
+            self.finish(Err(Failure {
+                message: "작업이 예기치 않게 중단되었습니다. 게임 파일 상태를 확인할 수 없으니 되돌리기나 Steam 파일 무결성 검사로 점검해주세요.".to_string(),
+                game_intact: false,
+                cancelled: false,
+            }));
+        }
+
         if finished {
             self.rx = None;
             self.detail = None;
         }
     }
 
+    fn request_close(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if self.close_pending {
+            return;
+        }
+        self.close_pending = true;
+
+        if self.cancellable() {
+            self.cancel.cancel();
+            self.log(
+                Level::Warning,
+                "창을 닫기 위해 설치를 취소합니다. 정리가 끝나면 창이 닫힙니다…",
+            );
+        } else {
+            self.log(
+                Level::Warning,
+                "게임 파일을 바꾸는 중이라 멈출 수 없습니다. 작업이 끝나면 창이 닫힙니다…",
+            );
+        }
+    }
+
     fn finish(&mut self, result: Result<Outcome, Failure>) {
         let restoring = self.restoring();
         self.hints_dirty = true;
+
+        let broken = matches!(&result, Err(failure) if !failure.game_intact);
+        if std::mem::take(&mut self.close_pending) && !broken {
+            self.close_ready = true;
+        }
 
         match result {
             Ok(Outcome::Installed(report)) => {
@@ -378,6 +447,7 @@ impl InstallerApp {
             Err(failure) => {
                 self.phase = Phase::Failed {
                     intact: failure.game_intact,
+                    restoring,
                 };
                 self.log(Level::Error, failure.message.clone());
 
@@ -413,6 +483,21 @@ impl eframe::App for InstallerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain_worker();
+
+        if self.close_ready {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if self.busy() && ctx.input(|i| i.viewport().close_requested()) {
+            self.request_close(&ctx);
+        }
+
+        let window_focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if window_focused && !self.window_focused {
+            self.hints_dirty = true;
+        }
+        self.window_focused = window_focused;
+
         self.refresh_hints();
 
         if self.busy() {
@@ -420,6 +505,7 @@ impl eframe::App for InstallerApp {
         }
 
         let idle = !self.busy() && self.dialog.is_none();
+        let focused = ctx.memory(|m| m.focused().is_some());
         if idle {
             let dropped = ctx.input(|i| {
                 i.raw
@@ -430,7 +516,7 @@ impl eframe::App for InstallerApp {
             if let Some(path) = dropped {
                 self.accept_drop(path);
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && self.ready() {
+            if !focused && ctx.input(|i| i.key_pressed(egui::Key::Enter)) && self.ready() {
                 self.start_install(&ctx);
             }
         }
@@ -688,7 +774,7 @@ impl InstallerApp {
             self.start_install(ctx);
         }
         if secondary_clicked {
-            if self.busy() {
+            if self.cancellable() {
                 self.cancel.cancel();
                 self.log(Level::Warning, "취소를 요청했습니다. 정리하는 중입니다…");
             } else {
@@ -700,12 +786,14 @@ impl InstallerApp {
     fn secondary_action(&self) -> (&'static str, bool, &'static str) {
         if self.restoring() {
             ("되돌리기", false, "되돌리는 중에는 멈출 수 없습니다")
-        } else if self.busy() {
+        } else if self.cancellable() {
             (
                 "취소",
                 true,
                 "진행 중인 설치를 멈춥니다. 게임 파일은 그대로입니다",
             )
+        } else if self.busy() {
+            ("취소", false, "게임 파일을 바꾸는 중이라 멈출 수 없습니다")
         } else if !matches!(self.game_hint, Hint::Ok(_)) {
             ("되돌리기", false, "게임 폴더를 먼저 확인해주세요")
         } else if !self.patched {
@@ -1046,14 +1134,16 @@ fn check_game(path: &str) -> (Hint, bool) {
     }
 
     let entered = PathBuf::from(path);
-    match locate_asar(&entered) {
-        Ok(asar) => {
-            let patched = backup_path(&asar).is_file();
-            (
-                Hint::Ok(format!("확인됨 · {}", location_label(&entered, &asar))),
-                patched,
-            )
-        }
+    let asar = match locate_asar(&entered) {
+        Ok(asar) => asar,
+        Err(e) => return (Hint::Bad(e.to_string()), false),
+    };
+
+    match patch_state(&asar) {
+        Ok(state) => (
+            Hint::Ok(format!("확인됨 · {}", location_label(&entered, &asar))),
+            state == PatchState::Patched,
+        ),
         Err(e) => (Hint::Bad(e.to_string()), false),
     }
 }
@@ -1063,21 +1153,9 @@ fn check_data(path: &str) -> Hint {
     if path.is_empty() {
         return Hint::None;
     }
-    let root = PathBuf::from(path);
-    if !root.is_dir() {
-        return Hint::Bad("폴더가 없습니다.".to_string());
-    }
-
-    let missing: Vec<&str> = PATCH_DIRS
-        .iter()
-        .copied()
-        .filter(|dir| !root.join(dir).is_dir())
-        .collect();
-
-    if missing.is_empty() {
-        Hint::Ok(format!("확인됨 · 폴더 {}개", PATCH_DIRS.len()))
-    } else {
-        Hint::Bad(format!("빠진 폴더: {}", missing.join(", ")))
+    match check_data_dir(Path::new(path)) {
+        Ok(()) => Hint::Ok(format!("확인됨 · 폴더 {}개", PATCH_DIRS.len())),
+        Err(e) => Hint::Bad(e.to_string()),
     }
 }
 

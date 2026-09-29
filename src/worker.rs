@@ -24,24 +24,12 @@ pub struct Failure {
     pub cancelled: bool,
 }
 
-impl Failure {
-    fn from_install(error: InstallError) -> Self {
+impl From<InstallError> for Failure {
+    fn from(error: InstallError) -> Self {
         Failure {
             message: error.to_string(),
             game_intact: error.leaves_game_intact(),
             cancelled: error.is_cancelled(),
-        }
-    }
-
-    fn from_restore(error: InstallError) -> Self {
-        let game_intact = !matches!(
-            error,
-            InstallError::Io { .. } | InstallError::RollbackFailed { .. }
-        );
-        Failure {
-            message: error.to_string(),
-            game_intact,
-            cancelled: false,
         }
     }
 }
@@ -69,10 +57,10 @@ pub fn spawn(job: Job, ctx: egui::Context) -> Receiver<Msg> {
         let result = match job {
             Job::Install(config) => install(&config, &reporter)
                 .map(|report| Outcome::Installed(Box::new(report)))
-                .map_err(Failure::from_install),
+                .map_err(Failure::from),
             Job::Restore(asar) => restore(&asar, &reporter)
                 .map(|()| Outcome::Restored)
-                .map_err(Failure::from_restore),
+                .map_err(Failure::from),
         };
 
         let _ = tx.send(Msg::Done(result));

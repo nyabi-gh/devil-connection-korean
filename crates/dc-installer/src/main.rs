@@ -142,9 +142,9 @@ fn run(cli: Cli) -> std::result::Result<(), Box<dyn std::error::Error>> {
                 }
             );
             match patch_state(&asar) {
-                Ok(PatchState::Patched) => println!("상태:        패치 적용됨"),
-                Ok(PatchState::Original) => println!("상태:        원본"),
-                Err(e) => println!("상태:        확인 실패 - {e}"),
+                Ok(PatchState::Patched) => println!("상태:       패치 적용됨"),
+                Ok(PatchState::Original) => println!("상태:       원본"),
+                Err(e) => println!("상태:       확인 실패 - {e}"),
             }
             match archive.validate() {
                 Ok(()) => println!("헤더 검증:   통과"),
