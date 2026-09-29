@@ -109,7 +109,15 @@ pub fn create_archive_observed(
     let mut packed: Vec<(String, PathBuf, u64)> = Vec::new();
     let mut unpacked_dirs: BTreeSet<String> = BTreeSet::new();
     let mut offset: u64 = 0;
-    let mut scan = Ticker::new(observer, "파일 검사", entries.len() as u64);
+    let file_count = entries
+        .iter()
+        .filter(|entry| matches!(entry.kind, SourceKind::File { .. }))
+        .count();
+    let mut ticker = Ticker::new(
+        observer,
+        "아카이브 생성",
+        (entries.len() + file_count) as u64,
+    );
 
     for entry in &entries {
         match &entry.kind {
@@ -184,7 +192,7 @@ pub fn create_archive_observed(
             }
         }
 
-        scan.tick()?;
+        ticker.tick()?;
     }
 
     let header_bytes = header::serialize(&root)?;
@@ -199,7 +207,6 @@ pub fn create_archive_observed(
         .map_err(|e| AsarError::io(dest, e))?;
 
     let mut buf = vec![0u8; COPY_CHUNK];
-    let mut write = Ticker::new(observer, "아카이브 쓰기", packed.len() as u64);
 
     for (rel_path, source, expected_size) in &packed {
         let mut input = File::open(source).map_err(|e| AsarError::io(source, e))?;
@@ -224,7 +231,7 @@ pub fn create_archive_observed(
             });
         }
 
-        write.tick()?;
+        ticker.tick()?;
     }
 
     writer.flush().map_err(|e| AsarError::io(dest, e))?;
@@ -232,6 +239,7 @@ pub fn create_archive_observed(
         .into_inner()
         .map_err(|e| AsarError::io(dest, e.into_error()))?;
     file.sync_all().map_err(|e| AsarError::io(dest, e))?;
+    ticker.finish();
 
     stats.archive_bytes = header_bytes.len() as u64 + offset;
     Ok(stats)

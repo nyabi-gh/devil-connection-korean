@@ -45,4 +45,11 @@ impl<'a> Ticker<'a> {
         }
         Ok(())
     }
+
+    pub(crate) fn finish(&mut self) {
+        if self.done < self.total {
+            self.done = self.total;
+            self.observer.advance(self.task, self.done, self.total);
+        }
+    }
 }
