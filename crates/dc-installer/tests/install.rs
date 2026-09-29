@@ -1,10 +1,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use dc_asar::{ArchiveRoot, AsarArchive, PackOptions, create_archive, create_archive_from};
+use dc_asar::{
+    ArchiveRoot, AsarArchive, PackOptions, create_archive, create_archive_from, unpacked_dir_for,
+};
 use dc_installer::{
-    Cancel, InstallConfig, InstallError, PATCH_DIRS, SilentReporter, TranslationSource, install,
-    restore,
+    Cancel, InstallConfig, InstallError, PATCH_DIRS, PatchState, SilentReporter, TranslationSource,
+    install, patch_state, restore, stamp_path,
 };
 
 struct Fixture {
@@ -20,36 +22,10 @@ impl Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
 
-        let original = root.join("original-app");
-        write_file(&original.join("index.html"), b"<html>original</html>");
-        write_file(&original.join("package.json"), br#"{"main":"index.js"}"#);
-        write_file(
-            &original.join("data/scenario/first.ks"),
-            "원본 시나리오".as_bytes(),
-        );
-        write_file(
-            &original.join("data/scenario/keep.ks"),
-            "건드리지 않음".as_bytes(),
-        );
-        write_file(&original.join("data/image/logo.png"), b"\x89PNG original");
-        write_file(&original.join("data/others/master_data.js"), b"var m={};");
-        write_file(&original.join("tyrano/tyrano.css"), b"body{color:red}");
-        write_file(&original.join("bin/native.node"), b"native module");
-        write_file(&original.join("bin/libsteam_api.dylib"), b"shared library");
-
         let game_dir = root.join("game");
         let asar = game_dir.join("resources/app.asar");
         fs::create_dir_all(asar.parent().unwrap()).unwrap();
-        create_archive(
-            &original,
-            &asar,
-            &PackOptions {
-                unpack: vec!["*.node".to_string(), "*.dylib".to_string()],
-                ..PackOptions::default()
-            },
-        )
-        .unwrap();
-        let pristine = fs::read(&asar).unwrap();
+        let pristine = pack_original(&root.join("original-app"), &asar, b"<html>original</html>");
 
         let data_dir = root.join("patch-data");
         for dir in PATCH_DIRS {
@@ -115,6 +91,12 @@ impl Fixture {
         }
     }
 
+    fn simulate_game_update(&self) -> Vec<u8> {
+        let source = self._tmp.path().join("updated-app");
+        fs::remove_dir_all(unpacked_dir_for(&self.asar)).unwrap();
+        pack_original(&source, &self.asar, b"<html>updated</html>")
+    }
+
     fn backup(&self) -> PathBuf {
         self.asar.with_file_name("app.asar.backup")
     }
@@ -147,6 +129,35 @@ fn cancelling_stops_the_install_and_leaves_the_game_untouched() {
     assert!(error.leaves_game_intact());
     assert_eq!(fs::read(&fx.asar).unwrap(), fx.pristine);
     assert_no_work_dirs(&fx.resources());
+}
+
+fn pack_original(source: &Path, asar: &Path, index_html: &[u8]) -> Vec<u8> {
+    write_file(&source.join("index.html"), index_html);
+    write_file(&source.join("package.json"), br#"{"main":"index.js"}"#);
+    write_file(
+        &source.join("data/scenario/first.ks"),
+        "원본 시나리오".as_bytes(),
+    );
+    write_file(
+        &source.join("data/scenario/keep.ks"),
+        "건드리지 않음".as_bytes(),
+    );
+    write_file(&source.join("data/image/logo.png"), b"\x89PNG original");
+    write_file(&source.join("data/others/master_data.js"), b"var m={};");
+    write_file(&source.join("tyrano/tyrano.css"), b"body{color:red}");
+    write_file(&source.join("bin/native.node"), b"native module");
+    write_file(&source.join("bin/libsteam_api.dylib"), b"shared library");
+
+    create_archive(
+        source,
+        asar,
+        &PackOptions {
+            unpack: vec!["*.node".to_string(), "*.dylib".to_string()],
+            ..PackOptions::default()
+        },
+    )
+    .unwrap();
+    fs::read(asar).unwrap()
 }
 
 fn write_file(path: &Path, contents: &[u8]) {
@@ -270,14 +281,114 @@ fn restore_returns_the_original_archive() {
 }
 
 #[test]
-fn restore_without_backup_reports_clearly() {
+fn restoring_an_unpatched_game_is_refused() {
     let fx = Fixture::new();
     let err = restore(&fx.asar, &SilentReporter).unwrap_err();
     assert!(
-        matches!(err, InstallError::BackupMissing(_)),
+        matches!(err, InstallError::NotPatched),
         "예상과 다른 오류: {err}"
     );
     assert_eq!(fs::read(&fx.asar).unwrap(), fx.pristine);
+}
+
+#[test]
+fn patch_state_follows_install_and_restore() {
+    let fx = Fixture::new();
+    assert_eq!(patch_state(&fx.asar).unwrap(), PatchState::Original);
+
+    install(&fx.config(), &SilentReporter).unwrap();
+    assert_eq!(patch_state(&fx.asar).unwrap(), PatchState::Patched);
+
+    restore(&fx.asar, &SilentReporter).unwrap();
+    assert_eq!(patch_state(&fx.asar).unwrap(), PatchState::Original);
+    assert!(fx.backup().is_file());
+
+    install(&fx.config(), &SilentReporter).unwrap();
+    assert_eq!(patch_state(&fx.asar).unwrap(), PatchState::Patched);
+    assert_eq!(fs::read(fx.backup()).unwrap(), fx.pristine);
+}
+
+#[test]
+fn reinstalling_after_a_game_update_rebuilds_the_backup() {
+    let fx = Fixture::new();
+    install(&fx.config(), &SilentReporter).unwrap();
+
+    let updated = fx.simulate_game_update();
+    assert_eq!(patch_state(&fx.asar).unwrap(), PatchState::Original);
+
+    install(&fx.config(), &SilentReporter).unwrap();
+
+    assert_eq!(fs::read(fx.backup()).unwrap(), updated);
+    assert_eq!(fx.read_from_archive("index.html"), b"<html>updated</html>");
+    assert_eq!(
+        fx.read_from_archive("data/scenario/first.ks"),
+        "번역된 시나리오".as_bytes()
+    );
+    assert_eq!(patch_state(&fx.asar).unwrap(), PatchState::Patched);
+
+    restore(&fx.asar, &SilentReporter).unwrap();
+    assert_eq!(fs::read(&fx.asar).unwrap(), updated);
+}
+
+#[test]
+fn restoring_after_a_game_update_keeps_the_new_version() {
+    let fx = Fixture::new();
+    install(&fx.config(), &SilentReporter).unwrap();
+    let updated = fx.simulate_game_update();
+
+    let err = restore(&fx.asar, &SilentReporter).unwrap_err();
+
+    assert!(
+        matches!(err, InstallError::NotPatched),
+        "예상과 다른 오류: {err}"
+    );
+    assert_eq!(fs::read(&fx.asar).unwrap(), updated);
+}
+
+#[test]
+fn an_install_from_an_older_patcher_is_still_recognised() {
+    let fx = Fixture::new();
+    install(&fx.config(), &SilentReporter).unwrap();
+    fs::remove_file(stamp_path(&fx.asar)).unwrap();
+
+    assert_eq!(patch_state(&fx.asar).unwrap(), PatchState::Patched);
+
+    install(&fx.config(), &SilentReporter).unwrap();
+    assert_eq!(fs::read(fx.backup()).unwrap(), fx.pristine);
+}
+
+#[test]
+fn a_game_update_over_an_older_patcher_install_is_detected() {
+    let fx = Fixture::new();
+    install(&fx.config(), &SilentReporter).unwrap();
+    fs::remove_file(stamp_path(&fx.asar)).unwrap();
+    let updated = fx.simulate_game_update();
+
+    assert_eq!(patch_state(&fx.asar).unwrap(), PatchState::Original);
+
+    install(&fx.config(), &SilentReporter).unwrap();
+    assert_eq!(fs::read(fx.backup()).unwrap(), updated);
+}
+
+#[test]
+fn a_patched_game_without_its_backup_is_left_alone() {
+    let fx = Fixture::new();
+    install(&fx.config(), &SilentReporter).unwrap();
+    let patched = fs::read(&fx.asar).unwrap();
+    fs::remove_file(fx.backup()).unwrap();
+
+    let err = install(&fx.config(), &SilentReporter).unwrap_err();
+    assert!(
+        matches!(err, InstallError::PatchedWithoutBackup(_)),
+        "예상과 다른 오류: {err}"
+    );
+
+    let err = restore(&fx.asar, &SilentReporter).unwrap_err();
+    assert!(
+        matches!(err, InstallError::PatchedWithoutBackup(_)),
+        "예상과 다른 오류: {err}"
+    );
+    assert_eq!(fs::read(&fx.asar).unwrap(), patched);
 }
 
 #[test]
@@ -351,6 +462,8 @@ fn install_recovers_when_a_previous_run_was_interrupted() {
         "번역된 시나리오".as_bytes()
     );
     assert_eq!(fs::read(fx.backup()).unwrap(), fx.pristine);
+    assert_no_work_dirs(&fx.resources());
+    assert!(!fx.asar.with_file_name("app.asar.backup.partial").exists());
 }
 
 #[test]

@@ -11,6 +11,7 @@ use crate::cancel::Cancel;
 use crate::error::{InstallError, Result};
 use crate::fsutil::{self, CopyStats};
 use crate::progress::{Event, Reporter, info, success, warn};
+use crate::state::{self, PatchState};
 
 pub const PATCH_DIRS: &[&str] = &[
     "data/scenario",
@@ -32,6 +33,7 @@ pub struct StepInfo {
     pub label: &'static str,
     pub detail: &'static str,
     pub weight: u32,
+    pub cancellable: bool,
 }
 
 pub const STEPS: &[StepInfo] = &[
@@ -39,41 +41,49 @@ pub const STEPS: &[StepInfo] = &[
         label: "준비 확인",
         detail: "설치 준비 상태를 확인합니다",
         weight: 1,
+        cancellable: true,
     },
     StepInfo {
         label: "원본 백업",
         detail: "원본 파일을 백업합니다",
         weight: 4,
+        cancellable: true,
     },
     StepInfo {
         label: "원본 해제",
         detail: "원본 app.asar을 해제합니다 (시간이 걸릴 수 있습니다)",
         weight: 10,
+        cancellable: true,
     },
     StepInfo {
         label: "번역 적용",
         detail: "번역 데이터를 덮어씁니다",
         weight: 4,
+        cancellable: true,
     },
     StepInfo {
         label: "재압축",
         detail: "app.asar을 다시 만듭니다 (시간이 걸릴 수 있습니다)",
         weight: 12,
+        cancellable: true,
     },
     StepInfo {
         label: "검증",
         detail: "생성한 아카이브를 검증합니다",
         weight: 4,
+        cancellable: true,
     },
     StepInfo {
         label: "교체",
         detail: "게임 파일을 교체합니다",
         weight: 2,
+        cancellable: false,
     },
     StepInfo {
         label: "정리",
         detail: "임시 파일을 정리합니다",
         weight: 1,
+        cancellable: false,
     },
 ];
 
@@ -115,13 +125,14 @@ struct Paths {
     app: PathBuf,
     new_asar: PathBuf,
     new_asar_unpacked: PathBuf,
+    prev_unpacked: PathBuf,
 }
 
 impl Paths {
     fn new(asar: PathBuf, work: PathBuf) -> Self {
         let asar_unpacked = unpacked_dir_for(&asar);
         let new_asar = work.join("app.asar.new");
-        let backup = with_suffix(&asar, ".backup");
+        let backup = backup_path(&asar);
 
         Paths {
             backup_unpacked: unpacked_dir_for(&backup),
@@ -131,19 +142,14 @@ impl Paths {
             app: work.join("app"),
             new_asar_unpacked: unpacked_dir_for(&new_asar),
             new_asar,
+            prev_unpacked: work.join("prev.unpacked"),
             work,
         }
     }
 }
 
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(suffix);
-    path.with_file_name(name)
-}
-
 pub fn backup_path(asar_path: &Path) -> PathBuf {
-    with_suffix(asar_path, ".backup")
+    fsutil::with_suffix(asar_path, ".backup")
 }
 
 struct StepObserver<'a> {
@@ -177,6 +183,18 @@ pub fn install(config: &InstallConfig, reporter: &dyn Reporter) -> Result<Instal
     step(reporter, 1);
     let preflight = preflight(config, reporter)?;
 
+    match fsutil::remove_prefixed(&preflight.resources, WORK_DIR_PREFIX) {
+        Ok(0) => {}
+        Ok(count) => info(
+            reporter,
+            format!("이전에 중단된 작업 폴더 {count}개를 정리했습니다"),
+        ),
+        Err(e) => warn(
+            reporter,
+            format!("이전 작업 폴더를 정리하지 못했습니다: {e}"),
+        ),
+    }
+
     let work = fsutil::create_work_dir(&preflight.resources, WORK_DIR_PREFIX)?;
     let paths = Paths::new(config.asar_path.clone(), work);
 
@@ -207,7 +225,7 @@ fn run_install(
 
     config.cancel.check()?;
     step(reporter, 2);
-    ensure_backup(paths, reporter)?;
+    ensure_backup(paths, preflight.state, reporter)?;
 
     config.cancel.check()?;
     step(reporter, 3);
@@ -280,7 +298,7 @@ fn run_install(
 
     config.cancel.check()?;
     step(reporter, 6);
-    let verified = verify(
+    let (verified, digest) = verify(
         &paths.new_asar,
         &copied,
         original_entries,
@@ -290,9 +308,11 @@ fn run_install(
 
     config.cancel.check()?;
     step(reporter, 7);
-    if let Err(cause) = commit(paths) {
-        warn(reporter, "교체에 실패했습니다. 원본을 복구합니다.");
-        return Err(match rollback(paths) {
+    fsutil::remove_path(&state::stamp_path(&paths.asar))?;
+    let mut progress = CommitProgress::default();
+    if let Err(cause) = commit(paths, &mut progress) {
+        warn(reporter, "교체에 실패했습니다. 설치 전 상태로 되돌립니다.");
+        return Err(match rollback(paths, progress) {
             Ok(()) => InstallError::RolledBack(cause.to_string()),
             Err(rollback_err) => InstallError::RollbackFailed {
                 cause: cause.to_string(),
@@ -302,6 +322,9 @@ fn run_install(
         });
     }
     success(reporter, "교체 완료");
+    if let Err(e) = state::write_stamp(&paths.asar, digest) {
+        warn(reporter, format!("패치 기록을 남기지 못했습니다: {e}"));
+    }
 
     step(reporter, 8);
     let stale_app = preflight.resources.join("app");
@@ -322,6 +345,7 @@ fn run_install(
 
 struct Preflight {
     resources: PathBuf,
+    state: PatchState,
 }
 
 fn preflight(config: &InstallConfig, reporter: &dyn Reporter) -> Result<Preflight> {
@@ -338,17 +362,27 @@ fn preflight(config: &InstallConfig, reporter: &dyn Reporter) -> Result<Prefligh
 
     let data_size = check_source(&config.source)?;
     fsutil::check_writable(&resources)?;
+    fsutil::ensure_unlocked(asar)?;
 
     let archive = AsarArchive::open(asar)?;
     archive.validate()?;
     drop(archive);
 
+    let state = state::patch_state(asar)?;
+    let backup = backup_path(asar);
+    if state == PatchState::Patched && !backup.is_file() {
+        return Err(InstallError::PatchedWithoutBackup(backup));
+    }
+
     let archive_size = fs::metadata(asar)
         .map_err(|e| InstallError::io(asar, e))?
         .len();
 
-    let backup_exists = backup_path(asar).is_file();
-    let required = archive_size * if backup_exists { 2 } else { 3 } + data_size * 2 + SPACE_MARGIN;
+    let copies = match state {
+        PatchState::Patched => 2,
+        PatchState::Original => 3,
+    };
+    let required = archive_size * copies + data_size * 2 + SPACE_MARGIN;
     let available = fsutil::available_space(&resources)?;
     if available < required {
         return Err(InstallError::NotEnoughSpace {
@@ -367,7 +401,7 @@ fn preflight(config: &InstallConfig, reporter: &dyn Reporter) -> Result<Prefligh
         ),
     );
 
-    Ok(Preflight { resources })
+    Ok(Preflight { resources, state })
 }
 
 pub fn find_data_dir() -> Option<PathBuf> {
@@ -388,7 +422,7 @@ pub fn find_data_dir() -> Option<PathBuf> {
         .find(|candidate| check_data_dir(candidate).is_ok())
 }
 
-fn check_data_dir(data_dir: &Path) -> Result<()> {
+pub fn check_data_dir(data_dir: &Path) -> Result<()> {
     if !data_dir.is_dir() {
         return Err(InstallError::DataDirNotFound(data_dir.to_path_buf()));
     }
@@ -441,23 +475,30 @@ fn check_source(source: &TranslationSource) -> Result<u64> {
     }
 }
 
-fn ensure_backup(paths: &Paths, reporter: &dyn Reporter) -> Result<()> {
-    if paths.backup.is_file() {
+fn ensure_backup(paths: &Paths, state: PatchState, reporter: &dyn Reporter) -> Result<()> {
+    if state == PatchState::Patched {
         info(reporter, "기존 백업을 그대로 사용합니다");
-    } else {
-        let staging = with_suffix(&paths.asar, ".backup.partial");
-        fsutil::remove_path(&staging)?;
-        fsutil::copy_durable(&paths.asar, &staging)?;
-        fsutil::move_replace(&staging, &paths.backup)?;
-        success(reporter, format!("백업 생성: {}", paths.backup.display()));
+        return Ok(());
     }
 
-    if paths.asar_unpacked.is_dir() && !paths.backup_unpacked.exists() {
-        fsutil::copy_dir_all(&paths.asar_unpacked, &paths.backup_unpacked)?;
+    if paths.backup.is_file() {
+        info(
+            reporter,
+            "게임이 패치 이후 업데이트되었습니다. 현재 게임 파일로 백업을 새로 만듭니다",
+        );
+    }
+
+    fsutil::replace_file_with_copy(&paths.asar, &paths.backup)?;
+    success(reporter, format!("백업 생성: {}", paths.backup.display()));
+
+    if paths.asar_unpacked.is_dir() {
+        fsutil::replace_dir_with_copy(&paths.asar_unpacked, &paths.backup_unpacked)?;
         success(
             reporter,
             format!("unpacked 백업 생성: {}", paths.backup_unpacked.display()),
         );
+    } else {
+        fsutil::remove_path(&paths.backup_unpacked)?;
     }
 
     Ok(())
@@ -580,7 +621,7 @@ fn verify(
     original_entries: usize,
     reporter: &dyn Reporter,
     cancel: &Cancel,
-) -> Result<u64> {
+) -> Result<(u64, [u8; 32])> {
     let mut archive = AsarArchive::open(new_asar)?;
     archive.validate()?;
 
@@ -615,7 +656,7 @@ fn verify(
     }
 
     success(reporter, format!("번역 파일 {total}개 검증 완료"));
-    Ok(total)
+    Ok((total, archive.header_digest()))
 }
 
 fn hash_file(path: &Path) -> Result<[u8; 32]> {
@@ -636,37 +677,50 @@ fn hash_file(path: &Path) -> Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
-fn commit(paths: &Paths) -> Result<()> {
+#[derive(Debug, Clone, Copy, Default)]
+struct CommitProgress {
+    prev_unpacked_moved: bool,
+    new_unpacked_placed: bool,
+}
+
+fn commit(paths: &Paths, progress: &mut CommitProgress) -> Result<()> {
     if paths.asar_unpacked.is_dir() {
-        fsutil::move_replace(&paths.asar_unpacked, &paths.work.join("prev.unpacked"))?;
+        fsutil::move_replace(&paths.asar_unpacked, &paths.prev_unpacked)?;
+        progress.prev_unpacked_moved = true;
     }
     if paths.new_asar_unpacked.is_dir() {
         fsutil::move_replace(&paths.new_asar_unpacked, &paths.asar_unpacked)?;
+        progress.new_unpacked_placed = true;
     }
-    fsutil::move_replace(&paths.new_asar, &paths.asar)?;
-    Ok(())
+    fsutil::move_replace(&paths.new_asar, &paths.asar)
 }
 
-fn rollback(paths: &Paths) -> Result<()> {
-    if !paths.backup.is_file() {
-        return Err(InstallError::BackupMissing(paths.backup.clone()));
+fn rollback(paths: &Paths, progress: CommitProgress) -> Result<()> {
+    if !paths.asar.is_file() {
+        if !paths.backup.is_file() {
+            return Err(InstallError::BackupMissing(paths.backup.clone()));
+        }
+        fsutil::replace_file_with_copy(&paths.backup, &paths.asar)?;
     }
 
-    fsutil::remove_path(&paths.asar)?;
-    fsutil::copy_durable(&paths.backup, &paths.asar)?;
-
-    fsutil::remove_path(&paths.asar_unpacked)?;
-    if paths.backup_unpacked.is_dir() {
-        fsutil::copy_dir_all(&paths.backup_unpacked, &paths.asar_unpacked)?;
+    if progress.new_unpacked_placed {
+        fsutil::remove_path(&paths.asar_unpacked)?;
+    }
+    if progress.prev_unpacked_moved {
+        fsutil::move_replace(&paths.prev_unpacked, &paths.asar_unpacked)?;
     }
 
     Ok(())
 }
 
 pub fn restore(asar_path: &Path, reporter: &dyn Reporter) -> Result<()> {
+    if let Ok(PatchState::Original) = state::patch_state(asar_path) {
+        return Err(InstallError::NotPatched);
+    }
+
     let backup = backup_path(asar_path);
     if !backup.is_file() {
-        return Err(InstallError::BackupMissing(backup));
+        return Err(InstallError::PatchedWithoutBackup(backup));
     }
 
     let resources = asar_path
@@ -674,18 +728,20 @@ pub fn restore(asar_path: &Path, reporter: &dyn Reporter) -> Result<()> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     fsutil::check_writable(&resources)?;
+    if asar_path.is_file() {
+        fsutil::ensure_unlocked(asar_path)?;
+    }
 
     AsarArchive::open(&backup)?.validate()?;
 
     let asar_unpacked = unpacked_dir_for(asar_path);
     let backup_unpacked = unpacked_dir_for(&backup);
 
-    fsutil::remove_path(asar_path)?;
-    fsutil::copy_durable(&backup, asar_path)?;
-
-    fsutil::remove_path(&asar_unpacked)?;
+    fsutil::replace_file_with_copy(&backup, asar_path)?;
     if backup_unpacked.is_dir() {
-        fsutil::copy_dir_all(&backup_unpacked, &asar_unpacked)?;
+        fsutil::replace_dir_with_copy(&backup_unpacked, &asar_unpacked)?;
+    } else {
+        fsutil::remove_path(&asar_unpacked)?;
     }
 
     success(
@@ -700,9 +756,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn with_suffix_appends_to_full_name() {
+    fn backup_path_appends_to_full_name() {
         assert_eq!(
-            with_suffix(Path::new("/games/resources/app.asar"), ".backup"),
+            backup_path(Path::new("/games/resources/app.asar")),
             PathBuf::from("/games/resources/app.asar.backup")
         );
     }

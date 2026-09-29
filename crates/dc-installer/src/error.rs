@@ -24,6 +24,11 @@ pub enum InstallError {
     )]
     NotEnoughSpace { required_mb: u64, available_mb: u64 },
 
+    #[error(
+        "게임이 실행 중이라 '{0}' 파일을 바꿀 수 없습니다. 게임을 종료한 뒤 다시 시도해주세요."
+    )]
+    InUse(PathBuf),
+
     #[error("입출력 오류 ({path}): {source}")]
     Io {
         path: PathBuf,
@@ -37,7 +42,7 @@ pub enum InstallError {
     #[error("설치 검증에 실패했습니다: {0}")]
     Verification(String),
 
-    #[error("설치에 실패해 원본을 복구했습니다. 원인: {0}")]
+    #[error("설치에 실패해 게임 파일을 설치 전 상태로 되돌렸습니다. 원인: {0}")]
     RolledBack(String),
 
     #[error(
@@ -51,6 +56,14 @@ pub enum InstallError {
 
     #[error("백업 파일이 없습니다: {0}")]
     BackupMissing(PathBuf),
+
+    #[error(
+        "패치가 적용된 게임인데 원본 백업('{0}')이 없습니다. Steam에서 게임 파일 무결성을 검사해 원본으로 되돌린 뒤 다시 설치해주세요."
+    )]
+    PatchedWithoutBackup(PathBuf),
+
+    #[error("게임이 이미 원본 상태입니다. 되돌릴 패치가 없습니다.")]
+    NotPatched,
 
     #[error("설치를 취소했습니다. 게임 파일은 그대로입니다.")]
     Cancelled,

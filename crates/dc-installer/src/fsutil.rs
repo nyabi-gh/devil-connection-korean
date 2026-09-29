@@ -121,6 +121,69 @@ pub fn create_work_dir(parent: &Path, prefix: &str) -> Result<PathBuf> {
     ))
 }
 
+pub fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+pub fn replace_file_with_copy(src: &Path, dst: &Path) -> Result<()> {
+    let staging = with_suffix(dst, ".partial");
+    remove_path(&staging)?;
+    copy_durable(src, &staging)?;
+    move_replace(&staging, dst)
+}
+
+pub fn replace_dir_with_copy(src: &Path, dst: &Path) -> Result<()> {
+    let staging = with_suffix(dst, ".partial");
+    remove_path(&staging)?;
+    copy_dir_all(src, &staging)?;
+    move_replace(&staging, dst)
+}
+
+pub fn remove_prefixed(parent: &Path, prefix: &str) -> Result<u64> {
+    let mut removed = 0;
+    for item in fs::read_dir(parent).map_err(|e| InstallError::io(parent, e))? {
+        let item = item.map_err(|e| InstallError::io(parent, e))?;
+        if item.file_name().to_string_lossy().starts_with(prefix) {
+            remove_path(&item.path())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(windows)]
+pub fn ensure_unlocked(path: &Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+
+    match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+            ) =>
+        {
+            Err(InstallError::InUse(path.to_path_buf()))
+        }
+        Err(e) => Err(InstallError::io(path, e)),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn ensure_unlocked(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 pub fn copy_durable(src: &Path, dst: &Path) -> Result<u64> {
     let bytes = fs::copy(src, dst).map_err(|e| InstallError::io(src, e))?;
     let file = fs::OpenOptions::new()
@@ -210,6 +273,66 @@ mod tests {
         let b = create_work_dir(tmp.path(), ".work-").unwrap();
         assert_ne!(a, b);
         assert!(a.is_dir() && b.is_dir());
+    }
+
+    #[test]
+    fn replace_file_with_copy_swaps_in_place_and_leaves_no_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("backup.bin");
+        let dst = tmp.path().join("app.bin");
+        fs::write(&src, b"original").unwrap();
+        fs::write(&dst, b"patched").unwrap();
+        fs::write(tmp.path().join("app.bin.partial"), b"stale").unwrap();
+
+        replace_file_with_copy(&src, &dst).unwrap();
+
+        assert_eq!(fs::read(&dst).unwrap(), b"original");
+        assert_eq!(fs::read(&src).unwrap(), b"original");
+        assert!(!tmp.path().join("app.bin.partial").exists());
+    }
+
+    #[test]
+    fn replace_dir_with_copy_drops_files_missing_from_the_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("keep.node"), b"new").unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(dst.join("keep.node"), b"old").unwrap();
+        fs::write(dst.join("extra.node"), b"extra").unwrap();
+
+        replace_dir_with_copy(&src, &dst).unwrap();
+
+        assert_eq!(fs::read(dst.join("keep.node")).unwrap(), b"new");
+        assert!(!dst.join("extra.node").exists());
+    }
+
+    #[test]
+    fn remove_prefixed_only_touches_matching_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join(".work-0/app")).unwrap();
+        fs::write(tmp.path().join(".work-1"), b"").unwrap();
+        fs::write(tmp.path().join("app.asar"), b"").unwrap();
+
+        assert_eq!(remove_prefixed(tmp.path(), ".work-").unwrap(), 2);
+        assert!(tmp.path().join("app.asar").exists());
+        assert!(!tmp.path().join(".work-0").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ensure_unlocked_reports_a_file_held_open_elsewhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("app.asar");
+        fs::write(&path, b"x").unwrap();
+
+        ensure_unlocked(&path).unwrap();
+        let _held = fs::File::open(&path).unwrap();
+        assert!(matches!(
+            ensure_unlocked(&path),
+            Err(InstallError::InUse(_))
+        ));
     }
 
     #[test]

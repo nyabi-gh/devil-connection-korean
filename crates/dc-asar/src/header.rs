@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::{AsarError, Result};
 
@@ -168,7 +169,7 @@ fn flatten_into(node: &Node, prefix: &str, out: &mut Vec<Entry>) {
     }
 }
 
-pub fn read<R: Read>(reader: &mut R) -> Result<(Node, u64)> {
+pub fn read<R: Read>(reader: &mut R) -> Result<(Node, u64, [u8; 32])> {
     let mut size_buf = [0u8; SIZE_PICKLE_LEN as usize];
     reader.read_exact(&mut size_buf)?;
 
@@ -219,7 +220,13 @@ pub fn read<R: Read>(reader: &mut R) -> Result<(Node, u64)> {
         ));
     }
 
-    Ok((root, SIZE_PICKLE_LEN + header_len as u64))
+    let digest = Sha256::new()
+        .chain_update(size_buf)
+        .chain_update(&header_buf)
+        .finalize()
+        .into();
+
+    Ok((root, SIZE_PICKLE_LEN + header_len as u64, digest))
 }
 
 pub fn serialize(root: &Node) -> Result<Vec<u8>> {
@@ -276,7 +283,7 @@ mod tests {
     fn header_roundtrip() {
         let root = sample_root();
         let bytes = serialize(&root).unwrap();
-        let (parsed, data_offset) = read(&mut bytes.as_slice()).unwrap();
+        let (parsed, data_offset, _) = read(&mut bytes.as_slice()).unwrap();
         assert_eq!(parsed, root);
         assert_eq!(data_offset, bytes.len() as u64);
     }
@@ -296,7 +303,7 @@ mod tests {
             .unwrap();
             let bytes = serialize(&root).unwrap();
             assert_eq!(bytes.len() % 4, 0, "extra={extra}");
-            let (parsed, _) = read(&mut bytes.as_slice()).unwrap();
+            let (parsed, _, _) = read(&mut bytes.as_slice()).unwrap();
             assert_eq!(parsed, root);
         }
     }
